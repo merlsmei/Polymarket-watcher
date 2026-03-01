@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Allow HTTPS connections to Polymarket APIs -->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="false">
+        <domain includeSubdomains="true">polymarket.com</domain>
+        <domain includeSubdomains="true">gamma-api.polymarket.com</domain>
+        <domain includeSubdomains="true">data-api.polymarket.com</domain>
+        <domain includeSubdomains="true">clob.polymarket.com</domain>
+    </domain-config>
+</network-security-config>
