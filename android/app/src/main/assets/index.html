@@ -231,10 +231,7 @@
       font-weight: 500;
       color: var(--text);
       text-decoration: none;
-      max-width: 260px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
+      word-break: break-word;
     }
     .market-name:hover { color: var(--accent); }
     .dir-badge {
@@ -281,28 +278,50 @@
       font-size: 13px;
     }
 
-    /* ── Loading overlay ── */
+    /* ── Loading / Splash overlay ── */
     #loading {
       position: fixed;
       inset: 0;
-      background: rgba(13,17,23,.85);
+      background: #0d1117;
       display: flex;
       flex-direction: column;
       align-items: center;
       justify-content: center;
       z-index: 200;
-      gap: 16px;
+      gap: 0;
     }
     #loading.hidden { display: none; }
+    .splash-logo {
+      font-size: 36px;
+      font-weight: 800;
+      letter-spacing: -1px;
+      color: var(--accent);
+      margin-bottom: 4px;
+    }
+    .splash-logo span { color: var(--text); }
+    .splash-tagline {
+      font-size: 13px;
+      color: var(--muted);
+      letter-spacing: .5px;
+      text-transform: uppercase;
+      margin-bottom: 40px;
+    }
     .spinner {
-      width: 40px; height: 40px;
-      border: 3px solid var(--border);
+      width: 36px; height: 36px;
+      border: 3px solid rgba(88,166,255,.2);
       border-top-color: var(--accent);
       border-radius: 50%;
       animation: spin .8s linear infinite;
+      margin-bottom: 16px;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
-    #loading-msg { color: var(--muted); font-size: 13px; text-align: center; max-width: 280px; }
+    #loading-msg {
+      color: var(--muted);
+      font-size: 12px;
+      text-align: center;
+      max-width: 280px;
+      min-height: 18px;
+    }
 
     /* ── Summary bar ── */
     .summary-bar {
@@ -350,14 +369,15 @@
       .tables-row { grid-template-columns: 1fr; }
       .landscape-col { display: none !important; }
       .portrait-values { display: flex; }
-      .market-name { max-width: 100%; }
     }
   </style>
 </head>
 <body>
 
-<!-- Loading overlay -->
+<!-- Splash / Loading overlay -->
 <div id="loading">
+  <div class="splash-logo">Poly<span>Tracker</span></div>
+  <div class="splash-tagline">Macro Prediction Markets</div>
   <div class="spinner"></div>
   <div id="loading-msg">Fetching macro markets…</div>
 </div>
@@ -533,17 +553,33 @@ async function fetchMacroMarkets() {
       if (!Array.isArray(events) || events.length === 0) break;
 
       for (const ev of events) {
+        // Skip events with no slug (can't build a valid link)
+        if (!ev.slug) continue;
+        // Skip resolved/closed events
+        if (ev.closed === true || ev.archived === true) continue;
+        if (ev.endDate && new Date(ev.endDate) < new Date()) continue;
+
         const mkts = Array.isArray(ev.markets) ? ev.markets : [];
         for (const m of mkts) {
           const cid = m.conditionId || m.condition_id;
           if (!cid) continue;
+          // Skip inactive, closed, or resolved markets
+          if (m.active === false || m.closed === true || m.archived === true) continue;
+          if (m.endDate && new Date(m.endDate) < new Date()) continue;
+
           let prices = [];
           try { prices = m.outcomePrices ? JSON.parse(m.outcomePrices) : []; } catch {}
+          // Skip markets already resolved (≥99% certainty on any outcome)
+          if (prices.length > 0) {
+            const maxP = Math.max(...prices.map(p => parseFloat(p)).filter(p => !isNaN(p)));
+            if (maxP >= 0.99) continue;
+          }
+
           let outcomes = [];
           try { outcomes = m.outcomes ? JSON.parse(m.outcomes) : []; } catch {}
           markets[cid] = {
             title:    m.question || ev.title || 'Unknown',
-            slug:     ev.slug   || m.slug   || '',   // ev.slug always has a page
+            slug:     ev.slug,   // always use event slug — market slugs can 404
             tagId:    tag.id,
             tagName:  tag.name,
             prices,
@@ -629,8 +665,8 @@ function buildWindowRankings(trades, macroMarkets, windowSeconds, minBet, filter
     if (!byMarket[cid]) {
       byMarket[cid] = {
         conditionId: cid,
-        title:       t.title || meta.title,
-        slug:        t.slug  || meta.slug,
+        title:       meta.title,
+        slug:        meta.slug,  // always event-level slug — reliable link
         tagName:     meta.tagName,
         prices:      meta.prices,
         outcomes:    meta.outcomes,
