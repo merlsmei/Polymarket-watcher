@@ -362,6 +362,11 @@
   <span class="filter-label">Min bet</span>
   <input class="min-bet-input" type="number" id="min-bet" value="500" min="0" step="100" onchange="applyFilters()" />
   <span class="filter-label">USDC</span>
+  <div class="divider"></div>
+  <label class="filter-label" style="display:flex;align-items:center;gap:5px;cursor:pointer;user-select:none">
+    <input type="checkbox" id="filter-extreme" checked onchange="applyFilters()" />
+    Hide &lt;3% / &gt;97%
+  </label>
 </div>
 
 <!-- Time window tabs -->
@@ -559,7 +564,7 @@ async function fetchTrades(sinceTimestamp, minBet) {
 // ─────────────────────────────────────────────
 //  Build rankings for a single time window
 // ─────────────────────────────────────────────
-function buildWindowRankings(trades, macroMarkets, windowSeconds, minBet) {
+function buildWindowRankings(trades, macroMarkets, windowSeconds, minBet, filterExtreme) {
   const cutoff = Math.floor(Date.now() / 1000) - windowSeconds;
   const byMarket = {};
 
@@ -568,11 +573,22 @@ function buildWindowRankings(trades, macroMarkets, windowSeconds, minBet) {
     const cid = t.conditionId;
     if (!cid || !macroMarkets[cid]) continue;
 
+    const meta = macroMarkets[cid];
+
+    // Price-based filters — use the highest current outcome price
+    const pArr = (meta.prices || []).map(p => parseFloat(p)).filter(p => !isNaN(p));
+    if (pArr.length > 0) {
+      const maxP = Math.max(...pArr);
+      // Always filter: market essentially resolved (≥99% or ≤1%)
+      if (maxP >= 0.99) continue;
+      // Checkbox filter: near-certain (≥97% or ≤3%)
+      if (filterExtreme && maxP >= 0.97) continue;
+    }
+
     const usdcValue = parseFloat(t.size) * parseFloat(t.price);
     if (usdcValue < minBet) continue;
 
     if (!byMarket[cid]) {
-      const meta = macroMarkets[cid];
       byMarket[cid] = {
         conditionId: cid,
         title:       t.title || meta.title,
@@ -606,9 +622,10 @@ function buildWindowRankings(trades, macroMarkets, windowSeconds, minBet) {
 //  Build all rankings
 // ─────────────────────────────────────────────
 function buildAllRankings(minBet) {
+  const filterExtreme = document.getElementById('filter-extreme').checked;
   const result = {};
   for (const w of WINDOWS) {
-    result[w.id] = buildWindowRankings(allTrades, macroMarkets, w.seconds, minBet);
+    result[w.id] = buildWindowRankings(allTrades, macroMarkets, w.seconds, minBet, filterExtreme);
   }
   return result;
 }
@@ -636,7 +653,7 @@ function renderBetDirection(entry) {
   const low     = outcome.toLowerCase();
   const arrow   = low === 'yes' ? '▲' : low === 'no' ? '▼' : '●';
   const cls     = low === 'yes' ? 'dir-yes' : low === 'no' ? 'dir-no' : 'dir-mid';
-  return `<span class="dir-badge ${cls}">${arrow} ${outcome} ${fmtPrice(price)}</span>`;
+  return `<span class="dir-badge ${cls}">${arrow} ${outcome} ${fmtPrice(price)} · ${fmtUSDC(entry.maxBet)}</span>`;
 }
 
 function renderTable(rows, mode) {
