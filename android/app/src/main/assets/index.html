@@ -325,6 +325,33 @@
       font-size: 13px;
     }
     .countdown { font-size: 11px; color: var(--muted); }
+    .bg-refreshing {
+      font-size: 11px; color: var(--accent);
+      display: inline-flex; align-items: center; gap: 4px;
+    }
+    .bg-refreshing .spin-sm {
+      display: inline-block; width: 10px; height: 10px;
+      border: 1.5px solid rgba(88,166,255,.3);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin .7s linear infinite;
+    }
+
+    /* ── Portrait / narrow layout ── */
+    .portrait-values {
+      display: none;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 6px;
+      margin-top: 5px;
+      font-size: 12px;
+    }
+    @media (orientation: portrait), (max-width: 600px) {
+      .tables-row { grid-template-columns: 1fr; }
+      .landscape-col { display: none !important; }
+      .portrait-values { display: flex; }
+      .market-name { max-width: 100%; }
+    }
   </style>
 </head>
 <body>
@@ -411,7 +438,7 @@ const MACRO_TAGS = [
   { id: '100265', name: 'Geopolitics' },
 ];
 
-const REFRESH_INTERVAL_S = 120; // 2 min auto-refresh
+const REFRESH_INTERVAL_S = 60;  // 1 min auto-refresh
 const TRADE_PAGES_MAX = 40;     // max pages to paginate (40 × 500 = 20k trades)
 const SLEEP_MS = 300;           // between paginated requests
 
@@ -427,6 +454,7 @@ let fetching     = false;
 let lastFetchTs  = null;
 let refreshTimer = null;
 let countdownInterval = null;
+let isFirstLoad  = true;
 
 // ─────────────────────────────────────────────
 //  Utilities
@@ -443,6 +471,17 @@ function fmtPrice(p) {
   const pct = Math.round(parseFloat(p) * 100);
   if (isNaN(pct)) return '?';
   return pct + '%';
+}
+
+function fmtTimestamp(ts) {
+  if (!ts) return '';
+  const diffMs   = Date.now() - ts * 1000;
+  const diffMins = Math.floor(diffMs / 60_000);
+  if (diffMins < 1)  return 'just now';
+  if (diffMins < 60) return diffMins + 'm ago';
+  const diffHrs = Math.floor(diffMins / 60);
+  if (diffHrs < 24)  return diffHrs + 'h ago';
+  return Math.floor(diffHrs / 24) + 'd ago';
 }
 
 function priceClass(p) {
@@ -504,7 +543,7 @@ async function fetchMacroMarkets() {
           try { outcomes = m.outcomes ? JSON.parse(m.outcomes) : []; } catch {}
           markets[cid] = {
             title:    m.question || ev.title || 'Unknown',
-            slug:     m.slug   || ev.slug   || '',
+            slug:     ev.slug   || m.slug   || '',   // ev.slug always has a page
             tagId:    tag.id,
             tagName:  tag.name,
             prices,
@@ -525,7 +564,7 @@ async function fetchMacroMarkets() {
 // ─────────────────────────────────────────────
 //  API: Fetch trades from Data API
 // ─────────────────────────────────────────────
-async function fetchTrades(sinceTimestamp, minBet) {
+async function fetchTrades(sinceTimestamp, minBet, onProgress) {
   const trades = [];
   let offset = 0;
   let pages = 0;
@@ -554,8 +593,7 @@ async function fetchTrades(sinceTimestamp, minBet) {
     if (batch.length < 500) done = true;
     offset += batch.length;
     pages++;
-    document.getElementById('loading-msg').textContent =
-      `Fetching trades… (${trades.length.toLocaleString()} loaded, page ${pages})`;
+    onProgress && onProgress(`Fetching trades… ${trades.length.toLocaleString()} loaded`);
     if (!done) await sleep(SLEEP_MS);
   }
   return trades;
@@ -653,12 +691,13 @@ function renderBetDirection(entry) {
   const low     = outcome.toLowerCase();
   const arrow   = low === 'yes' ? '▲' : low === 'no' ? '▼' : '●';
   const cls     = low === 'yes' ? 'dir-yes' : low === 'no' ? 'dir-no' : 'dir-mid';
-  return `<span class="dir-badge ${cls}">${arrow} ${outcome} ${fmtPrice(price)} · ${fmtUSDC(entry.maxBet)}</span>`;
+  const ago = fmtTimestamp(t.timestamp);
+  return `<span class="dir-badge ${cls}">${arrow} ${outcome} ${fmtPrice(price)} · ${fmtUSDC(entry.maxBet)}${ago ? ' · ' + ago : ''}</span>`;
 }
 
 function renderTable(rows, mode) {
   if (!rows || rows.length === 0) {
-    return `<table><tbody><tr><td class="no-data" colspan="4">No trades in this window</td></tr></tbody></table>`;
+    return `<table><tbody><tr><td class="no-data" colspan="9">No trades in this window</td></tr></tbody></table>`;
   }
 
   const isVolume = mode === 'volume';
@@ -666,8 +705,8 @@ function renderTable(rows, mode) {
     <thead><tr>
       <th>#</th>
       <th>Market</th>
-      <th class="right">${isVolume ? 'Volume' : 'Biggest Bet'}</th>
-      <th class="right">Trades</th>
+      <th class="right landscape-col">${isVolume ? 'Volume' : 'Biggest Bet'}</th>
+      <th class="right landscape-col">Trades</th>
     </tr></thead>
     <tbody>`;
 
@@ -680,10 +719,15 @@ function renderTable(rows, mode) {
       <td>
         ${renderMarketName(r)}
         ${renderBetDirection(r)}
+        <div class="portrait-values">
+          <span class="vol">${fmtUSDC(mainValue)}</span>
+          <span class="vol-sub">${subValue}</span>
+          <span class="vol-sub">· ${r.tradeCount.toLocaleString()} trades</span>
+        </div>
         <small class="outcome-badge">${r.tagName || ''}</small>
       </td>
-      <td class="right"><span class="vol">${fmtUSDC(mainValue)}</span><br><span class="vol-sub">${subValue}</span></td>
-      <td class="right">${r.tradeCount.toLocaleString()}</td>
+      <td class="right landscape-col"><span class="vol">${fmtUSDC(mainValue)}</span><br><span class="vol-sub">${subValue}</span></td>
+      <td class="right landscape-col">${r.tradeCount.toLocaleString()}</td>
     </tr>`;
   }
 
@@ -749,26 +793,38 @@ function renderAllPanels() {
 // ─────────────────────────────────────────────
 //  Main refresh flow
 // ─────────────────────────────────────────────
+function setBgProgress(msg) {
+  // Replaces countdown text with an animated spinner + message
+  document.getElementById('next-refresh').innerHTML =
+    `<span class="bg-refreshing"><span class="spin-sm"></span>${msg}</span>`;
+}
+
 async function refresh(force = false) {
   if (fetching) return;
   fetching = true;
   clearCountdown();
   document.getElementById('refresh-btn').disabled = true;
-  setStatus('loading', 'Fetching…');
+  setStatus('loading', 'Refreshing…');
   showError('');
 
-  const minBet = parseFloat(document.getElementById('min-bet').value) || 0;
-  const oneWeekAgo = Math.floor(Date.now() / 1000) - 604_800;
+  const minBet      = parseFloat(document.getElementById('min-bet').value) || 0;
+  const oneWeekAgo  = Math.floor(Date.now() / 1000) - 604_800;
+  const firstLoad   = isFirstLoad;
+
+  // Progress routing: full overlay on first load, header ticker on background refreshes
+  const onProgress = firstLoad
+    ? msg => setLoading(true, msg)
+    : msg => setBgProgress(msg);
 
   try {
-    setLoading(true, 'Fetching macro markets…');
+    onProgress('Fetching macro markets…');
     macroMarkets = await fetchMacroMarkets();
 
     const marketCount = Object.keys(macroMarkets).length;
     if (marketCount === 0) throw new Error('No macro markets found. Polymarket API may be temporarily unavailable.');
 
-    setLoading(true, `Found ${marketCount} markets. Fetching recent large trades…`);
-    allTrades = await fetchTrades(oneWeekAgo, minBet);
+    onProgress(`Found ${marketCount} markets. Fetching trades…`);
+    allTrades = await fetchTrades(oneWeekAgo, minBet, onProgress);
 
     rankings = buildAllRankings(minBet);
     renderAllPanels();
@@ -780,8 +836,9 @@ async function refresh(force = false) {
     showError(err.message || 'Failed to fetch data. Check your network connection.');
     console.error(err);
   } finally {
-    setLoading(false);
-    fetching = false;
+    if (firstLoad) setLoading(false);
+    isFirstLoad = false;
+    fetching    = false;
     document.getElementById('refresh-btn').disabled = false;
     startCountdown();
   }
