@@ -237,6 +237,20 @@
       white-space: nowrap;
     }
     .market-name:hover { color: var(--accent); }
+    .dir-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 3px;
+      font-size: 11px;
+      font-weight: 700;
+      padding: 2px 7px;
+      border-radius: 3px;
+      margin-top: 4px;
+      letter-spacing: .3px;
+    }
+    .dir-yes { background: rgba(63,185,80,.18); color: var(--green); }
+    .dir-no  { background: rgba(248,81,73,.14); color: var(--red); }
+    .dir-mid { background: rgba(210,153,34,.14); color: var(--yellow); }
     .outcome-badge {
       display: inline-block;
       font-size: 10px;
@@ -484,8 +498,8 @@ async function fetchMacroMarkets() {
           let outcomes = [];
           try { outcomes = m.outcomes ? JSON.parse(m.outcomes) : []; } catch {}
           markets[cid] = {
-            title:    ev.title || m.question || 'Unknown',
-            slug:     ev.slug  || m.slug     || '',
+            title:    m.question || ev.title || 'Unknown',
+            slug:     m.slug   || ev.slug   || '',
             tagId:    tag.id,
             tagName:  tag.name,
             prices,
@@ -614,17 +628,20 @@ function renderMarketName(entry) {
   return `<a class="market-name" href="${href}" target="_blank" rel="noopener" title="${entry.title}">${entry.title}</a>`;
 }
 
-function renderOutcomePrice(entry) {
-  const p = entry.biggestTrade
-    ? parseFloat(entry.biggestTrade.price)
-    : parseFloat(entry.prices[0] || 0.5);
-  const outcome = entry.biggestTrade ? entry.biggestTrade.outcome : (entry.outcomes[0] || 'Yes');
-  return `<span class="price ${priceClass(p)}">${outcome} ${fmtPrice(p)}</span>`;
+function renderBetDirection(entry) {
+  const t = entry.biggestTrade;
+  if (!t) return '';
+  const outcome = (t.outcome || '').trim();
+  const price   = parseFloat(t.price);
+  const low     = outcome.toLowerCase();
+  const arrow   = low === 'yes' ? '▲' : low === 'no' ? '▼' : '●';
+  const cls     = low === 'yes' ? 'dir-yes' : low === 'no' ? 'dir-no' : 'dir-mid';
+  return `<span class="dir-badge ${cls}">${arrow} ${outcome} ${fmtPrice(price)}</span>`;
 }
 
 function renderTable(rows, mode) {
   if (!rows || rows.length === 0) {
-    return `<table><tbody><tr><td class="no-data" colspan="5">No trades in this window</td></tr></tbody></table>`;
+    return `<table><tbody><tr><td class="no-data" colspan="4">No trades in this window</td></tr></tbody></table>`;
   }
 
   const isVolume = mode === 'volume';
@@ -634,7 +651,6 @@ function renderTable(rows, mode) {
       <th>Market</th>
       <th class="right">${isVolume ? 'Volume' : 'Biggest Bet'}</th>
       <th class="right">Trades</th>
-      <th class="right">Odds</th>
     </tr></thead>
     <tbody>`;
 
@@ -644,10 +660,13 @@ function renderTable(rows, mode) {
     const subValue  = isVolume ? `${r.tradeCount} trade${r.tradeCount !== 1 ? 's' : ''}` : fmtUSDC(r.totalVolume) + ' vol';
     html += `<tr>
       <td>${renderRankBadge(i)}</td>
-      <td>${renderMarketName(r)}<br><small class="outcome-badge">${r.tagName || ''}</small></td>
+      <td>
+        ${renderMarketName(r)}
+        ${renderBetDirection(r)}
+        <small class="outcome-badge">${r.tagName || ''}</small>
+      </td>
       <td class="right"><span class="vol">${fmtUSDC(mainValue)}</span><br><span class="vol-sub">${subValue}</span></td>
       <td class="right">${r.tradeCount.toLocaleString()}</td>
-      <td class="right">${renderOutcomePrice(r)}</td>
     </tr>`;
   }
 
@@ -694,17 +713,17 @@ function renderAllPanels() {
       <div class="tables-row">
         <div class="table-card">
           <div class="table-card-header">
-            <span class="table-card-icon">📊</span>
-            <span class="table-card-title">Ranked by Total Volume</span>
-          </div>
-          ${renderTable(r.byVolume, 'volume')}
-        </div>
-        <div class="table-card">
-          <div class="table-card-header">
             <span class="table-card-icon">🐋</span>
             <span class="table-card-title">Ranked by Largest Single Bet</span>
           </div>
           ${renderTable(r.byLargestBet, 'largest')}
+        </div>
+        <div class="table-card">
+          <div class="table-card-header">
+            <span class="table-card-icon">📊</span>
+            <span class="table-card-title">Ranked by Total Volume</span>
+          </div>
+          ${renderTable(r.byVolume, 'volume')}
         </div>
       </div>`;
   }
