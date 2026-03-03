@@ -941,9 +941,16 @@ async function refresh(force = false) {
   const isFullFetch = firstLoad || newestTradeTs === 0;
   const sinceTs     = isFullFetch ? oneWeekAgo : newestTradeTs;
 
-  const onProgress = firstLoad
-    ? msg => setLoading(true, msg)
-    : msg => setBgProgress(msg);
+  // splashDismissed must be declared before onProgress so the closure can read it after
+  // onBatchDone sets it to true — otherwise onProgress keeps re-showing the splash
+  // for every page fetch in batches 2, 3, …
+  let splashDismissed = false;
+
+  const onProgress = msg => {
+    if (firstLoad && !splashDismissed) setLoading(true, msg); // splash phase only
+    else if (!firstLoad) setBgProgress(msg);                  // background refresh ticker
+    // if firstLoad && splashDismissed: panel progress bar handles it — do nothing
+  };
 
   try {
     onProgress('Fetching macro markets…');
@@ -957,7 +964,6 @@ async function refresh(force = false) {
 
     // Progressive batch callback: dismiss splash after first batch, show in-panel progress bar.
     // Only used for full fetches (first load or forced re-fetch after filter change).
-    let splashDismissed = false;
     const onBatchDone = isFullFetch ? (done, total, sortedTrades) => {
       allTrades = sortedTrades; // sortedTrades is the live collected[] reference — already sorted ASC
       loadingProgress = { done, total };
