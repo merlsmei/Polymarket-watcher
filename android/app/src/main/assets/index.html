@@ -407,7 +407,7 @@
   <button class="tag-btn" data-tag="100265" onclick="setTag(this,'100265')">🌍 Geopolitics</button>
   <div class="divider"></div>
   <span class="filter-label">Min bet</span>
-  <input class="min-bet-input" type="number" id="min-bet" value="500" min="0" step="100" onchange="applyFilters()" />
+  <input class="min-bet-input" type="number" id="min-bet" value="1000" min="0" step="100" onchange="applyFilters()" />
   <span class="filter-label">USDC</span>
   <div class="divider"></div>
   <label class="filter-label">Hide tails &lt;</label>
@@ -458,22 +458,25 @@ const MACRO_TAGS = [
 ];
 
 const REFRESH_INTERVAL_S = 60;  // 1 min auto-refresh
-const TRADE_PAGES_MAX = 120;    // max pages (120 × 500 = 60k trades, covers ~7 days of big trades)
+const TRADE_PAGES_MAX = 20;     // max pages per market-batch (batches are small — macro markets only)
+const BATCH_SIZE = 50;          // conditionIds per /trades?market= request
 const SLEEP_MS = 150;           // between paginated requests
 
 // ─────────────────────────────────────────────
 //  State
 // ─────────────────────────────────────────────
-let macroMarkets = {};    // conditionId → { title, slug, tagId, prices }
-let allTrades    = [];    // raw trades (last 1 week)
-let rankings     = {};    // windowId → { byVolume[], byLargestBet[] }
+let macroMarkets  = {};    // conditionId → { title, slug, tagId, prices }
+let allTrades     = [];    // trades sorted ASC by timestamp (oldest → newest), past 1 week
+let rankings      = {};    // windowId → { byVolume[], byLargestBet[] }
 let currentWindow = '1H';
-let activeTag    = 'all';
-let fetching     = false;
-let lastFetchTs  = null;
-let refreshTimer = null;
+let activeTag     = 'all';
+let fetching      = false;
+let lastFetchTs   = null;
+let refreshTimer  = null;
 let countdownInterval = null;
-let isFirstLoad  = true;
+let isFirstLoad   = true;
+let newestTradeTs = 0;    // Unix-seconds of the newest trade in allTrades (for incremental fetch)
+let fetchedMinBet = null; // minBet used for the last full fetch (detect threshold changes)
 
 // ─────────────────────────────────────────────
 //  Utilities
@@ -597,56 +600,78 @@ async function fetchMacroMarkets() {
 }
 
 // ─────────────────────────────────────────────
-//  API: Fetch trades from Data API
+//  API: Fetch trades — batched by conditionId
+//  Uses market= param to restrict to macro markets only,
+//  so each batch covers a tiny fraction of Polymarket's global volume.
 // ─────────────────────────────────────────────
-async function fetchTrades(sinceTimestamp, minBet, onProgress) {
-  const trades = [];
-  let offset = 0;
-  let pages = 0;
-  let done = false;
+async function fetchTradesBatched(sinceTs, minBet, conditionIds, onProgress) {
+  const collected = [];
 
-  while (!done && pages < TRADE_PAGES_MAX) {
-    const params = new URLSearchParams({
-      filterType:   'CASH',
-      filterAmount: String(minBet),
-      limit:        '500',
-      offset:       String(offset),
-      takerOnly:    'true',
-    });
-    let resp;
-    try { resp = await fetch(`${DATA_BASE}/trades?${params}`); } catch (e) { break; }
-    if (!resp.ok) break;
+  // Split conditionIds into batches of BATCH_SIZE
+  for (let b = 0; b < conditionIds.length; b += BATCH_SIZE) {
+    const batchIds = conditionIds.slice(b, b + BATCH_SIZE);
+    const marketParam = batchIds.join(',');
+    let offset = 0;
+    let pages  = 0;
+    let done   = false;
 
-    const batch = await resp.json();
-    if (!Array.isArray(batch) || batch.length === 0) break;
+    while (!done && pages < TRADE_PAGES_MAX) {
+      const params = new URLSearchParams({
+        market:       marketParam,
+        filterType:   'CASH',
+        filterAmount: String(minBet),
+        limit:        '500',
+        offset:       String(offset),
+        takerOnly:    'true',
+      });
+      let resp;
+      try { resp = await fetch(`${DATA_BASE}/trades?${params}`); } catch (e) { break; }
+      if (!resp.ok) break;
 
-    let added = 0;
-    for (const t of batch) {
-      // Parse as number; skip trades outside our window but don't stop yet
-      if ((+t.timestamp || 0) >= sinceTimestamp) {
-        trades.push(t);
-        added++;
+      const page = await resp.json();
+      if (!Array.isArray(page) || page.length === 0) break;
+
+      let added = 0;
+      for (const t of page) {
+        if ((+t.timestamp || 0) >= sinceTs) { collected.push(t); added++; }
       }
+      // Stop this batch when an entire page is older than sinceTs
+      if (added === 0 || page.length < 500) done = true;
+      offset += page.length;
+      pages++;
+      onProgress && onProgress(`Fetching trades… ${collected.length.toLocaleString()} loaded`);
+      if (!done) await sleep(SLEEP_MS);
     }
-    // Stop only when an entire batch contained no recent trades (we've gone past the window)
-    if (added === 0 || batch.length < 500) done = true;
-    offset += batch.length;
-    pages++;
-    onProgress && onProgress(`Fetching trades… ${trades.length.toLocaleString()} loaded`);
-    if (!done) await sleep(SLEEP_MS);
   }
-  return trades;
+
+  // Sort ASC by timestamp so allTrades stays oldest-first
+  collected.sort((a, b) => (+a.timestamp || 0) - (+b.timestamp || 0));
+  return collected;
 }
 
 // ─────────────────────────────────────────────
 //  Build rankings for a single time window
 // ─────────────────────────────────────────────
+
+// Binary search: first index in ASC-sorted trades[] where timestamp >= cutoff
+function binarySearchCutoff(trades, cutoff) {
+  let lo = 0, hi = trades.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if ((+trades[mid].timestamp || 0) < cutoff) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
 function buildWindowRankings(trades, macroMarkets, windowSeconds, minBet, filterThreshold) {
   const cutoff = Math.floor(Date.now() / 1000) - windowSeconds;
   const byMarket = {};
 
-  for (const t of trades) {
-    if (t.timestamp < cutoff) continue;
+  // trades is sorted ASC — binary-search to the window start instead of scanning all
+  const startIdx = binarySearchCutoff(trades, cutoff);
+  for (let i = startIdx; i < trades.length; i++) {
+    const t = trades[i];
     const cid = t.conditionId;
     if (!cid || !macroMarkets[cid]) continue;
 
@@ -847,11 +872,14 @@ async function refresh(force = false) {
   setStatus('loading', 'Refreshing…');
   showError('');
 
-  const minBet      = parseFloat(document.getElementById('min-bet').value) || 0;
-  const oneWeekAgo  = Math.floor(Date.now() / 1000) - 604_800;
-  const firstLoad   = isFirstLoad;
+  const minBet     = parseFloat(document.getElementById('min-bet').value) || 0;
+  const oneWeekAgo = Math.floor(Date.now() / 1000) - 604_800;
+  const firstLoad  = isFirstLoad;
 
-  // Progress routing: full overlay on first load, header ticker on background refreshes
+  // First load OR forced full re-fetch (minBet changed): fetch full 1W.
+  // Background refresh: fetch only trades since the newest trade we already have.
+  const sinceTs = (firstLoad || newestTradeTs === 0) ? oneWeekAgo : newestTradeTs;
+
   const onProgress = firstLoad
     ? msg => setLoading(true, msg)
     : msg => setBgProgress(msg);
@@ -860,11 +888,31 @@ async function refresh(force = false) {
     onProgress('Fetching macro markets…');
     macroMarkets = await fetchMacroMarkets();
 
-    const marketCount = Object.keys(macroMarkets).length;
-    if (marketCount === 0) throw new Error('No macro markets found. Polymarket API may be temporarily unavailable.');
+    const conditionIds = Object.keys(macroMarkets);
+    if (conditionIds.length === 0) throw new Error('No macro markets found. Polymarket API may be temporarily unavailable.');
 
-    onProgress(`Found ${marketCount} markets. Fetching trades…`);
-    allTrades = await fetchTrades(oneWeekAgo, minBet, onProgress);
+    const label = firstLoad ? '1 week' : 'last refresh';
+    onProgress(`Found ${conditionIds.length} markets. Fetching trades since ${label}…`);
+    const newTrades = await fetchTradesBatched(sinceTs, minBet, conditionIds, onProgress);
+
+    if (firstLoad || newestTradeTs === 0) {
+      allTrades = newTrades;  // full replace on first/forced load
+    } else {
+      // Merge: deduplicate by transactionHash, then prune trades older than 1W
+      const seen = new Set(allTrades.map(t => t.transactionHash));
+      const fresh = newTrades.filter(t => !seen.has(t.transactionHash));
+      allTrades = [...allTrades, ...fresh];
+      // Prune from front (allTrades is sorted ASC, old trades are at index 0)
+      let pruneIdx = 0;
+      while (pruneIdx < allTrades.length && (+allTrades[pruneIdx].timestamp || 0) < oneWeekAgo) pruneIdx++;
+      if (pruneIdx > 0) allTrades = allTrades.slice(pruneIdx);
+    }
+
+    // Track newest trade timestamp for next incremental fetch
+    if (allTrades.length > 0) {
+      newestTradeTs = +allTrades[allTrades.length - 1].timestamp || 0;
+    }
+    fetchedMinBet = minBet;
 
     rankings = buildAllRankings(minBet);
     renderAllPanels();
@@ -930,6 +978,13 @@ function setTag(el, tagId) {
 
 function applyFilters() {
   const minBet = parseFloat(document.getElementById('min-bet').value) || 0;
+  if (fetchedMinBet !== null && minBet !== fetchedMinBet) {
+    // Threshold changed — must re-fetch since the API filter changes too
+    newestTradeTs = 0;
+    allTrades = [];
+    triggerRefresh();
+    return;
+  }
   rankings = buildAllRankings(minBet);
   renderAllPanels();
 }
