@@ -410,10 +410,9 @@
   <input class="min-bet-input" type="number" id="min-bet" value="500" min="0" step="100" onchange="applyFilters()" />
   <span class="filter-label">USDC</span>
   <div class="divider"></div>
-  <label class="filter-label" style="display:flex;align-items:center;gap:5px;cursor:pointer;user-select:none">
-    <input type="checkbox" id="filter-extreme" checked onchange="applyFilters()" />
-    Hide &lt;3% / &gt;97%
-  </label>
+  <label class="filter-label">Hide tails &lt;</label>
+  <input class="min-bet-input" type="number" id="filter-extreme-pct" value="3" min="0" max="49" step="1" style="width:50px" onchange="applyFilters()" />
+  <span class="filter-label">% (&gt;100−X%)</span>
 </div>
 
 <!-- Time window tabs -->
@@ -459,8 +458,8 @@ const MACRO_TAGS = [
 ];
 
 const REFRESH_INTERVAL_S = 60;  // 1 min auto-refresh
-const TRADE_PAGES_MAX = 40;     // max pages to paginate (40 × 500 = 20k trades)
-const SLEEP_MS = 300;           // between paginated requests
+const TRADE_PAGES_MAX = 120;    // max pages (120 × 500 = 60k trades, covers ~7 days of big trades)
+const SLEEP_MS = 150;           // between paginated requests
 
 // ─────────────────────────────────────────────
 //  State
@@ -621,12 +620,16 @@ async function fetchTrades(sinceTimestamp, minBet, onProgress) {
     const batch = await resp.json();
     if (!Array.isArray(batch) || batch.length === 0) break;
 
+    let added = 0;
     for (const t of batch) {
-      if (t.timestamp < sinceTimestamp) { done = true; break; }
-      trades.push(t);
+      // Parse as number; skip trades outside our window but don't stop yet
+      if ((+t.timestamp || 0) >= sinceTimestamp) {
+        trades.push(t);
+        added++;
+      }
     }
-
-    if (batch.length < 500) done = true;
+    // Stop only when an entire batch contained no recent trades (we've gone past the window)
+    if (added === 0 || batch.length < 500) done = true;
     offset += batch.length;
     pages++;
     onProgress && onProgress(`Fetching trades… ${trades.length.toLocaleString()} loaded`);
@@ -638,7 +641,7 @@ async function fetchTrades(sinceTimestamp, minBet, onProgress) {
 // ─────────────────────────────────────────────
 //  Build rankings for a single time window
 // ─────────────────────────────────────────────
-function buildWindowRankings(trades, macroMarkets, windowSeconds, minBet, filterExtreme) {
+function buildWindowRankings(trades, macroMarkets, windowSeconds, minBet, filterThreshold) {
   const cutoff = Math.floor(Date.now() / 1000) - windowSeconds;
   const byMarket = {};
 
@@ -653,10 +656,10 @@ function buildWindowRankings(trades, macroMarkets, windowSeconds, minBet, filter
     const pArr = (meta.prices || []).map(p => parseFloat(p)).filter(p => !isNaN(p));
     if (pArr.length > 0) {
       const maxP = Math.max(...pArr);
-      // Always filter: market essentially resolved (≥99% or ≤1%)
+      // Always filter: market essentially resolved (≥99% certainty)
       if (maxP >= 0.99) continue;
-      // Checkbox filter: near-certain (≥97% or ≤3%)
-      if (filterExtreme && maxP >= 0.97) continue;
+      // User-defined tail filter: hide markets outside [X%, 100-X%]
+      if (filterThreshold > 0 && maxP >= (1 - filterThreshold)) continue;
     }
 
     const usdcValue = parseFloat(t.size) * parseFloat(t.price);
@@ -696,10 +699,11 @@ function buildWindowRankings(trades, macroMarkets, windowSeconds, minBet, filter
 //  Build all rankings
 // ─────────────────────────────────────────────
 function buildAllRankings(minBet) {
-  const filterExtreme = document.getElementById('filter-extreme').checked;
+  const filterPct = Math.max(0, Math.min(49, parseFloat(document.getElementById('filter-extreme-pct').value) || 0));
+  const filterThreshold = filterPct / 100;
   const result = {};
   for (const w of WINDOWS) {
-    result[w.id] = buildWindowRankings(allTrades, macroMarkets, w.seconds, minBet, filterExtreme);
+    result[w.id] = buildWindowRankings(allTrades, macroMarkets, w.seconds, minBet, filterThreshold);
   }
   return result;
 }
