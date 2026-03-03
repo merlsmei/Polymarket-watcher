@@ -356,6 +356,32 @@
       animation: spin .7s linear infinite;
     }
 
+    /* ── Panel loading progress bar ── */
+    .panel-loading-bar {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 7px 16px;
+      background: rgba(88,166,255,.05);
+      border-bottom: 1px solid rgba(88,166,255,.12);
+      font-size: 12px;
+      color: var(--text-dim);
+    }
+    .panel-loading-text { flex-shrink: 0; }
+    .progress-track {
+      flex: 1;
+      height: 3px;
+      background: rgba(255,255,255,.1);
+      border-radius: 2px;
+      overflow: hidden;
+    }
+    .progress-fill {
+      height: 100%;
+      background: var(--accent);
+      border-radius: 2px;
+      transition: width .3s ease;
+    }
+
     /* ── Portrait / narrow layout ── */
     .portrait-values {
       display: none;
@@ -465,9 +491,9 @@ const SLEEP_MS = 150;           // between paginated requests
 // ─────────────────────────────────────────────
 //  State
 // ─────────────────────────────────────────────
-let macroMarkets  = {};    // conditionId → { title, slug, tagId, prices }
+let macroMarketsAll = {};  // conditionId → { title, slug, tagId, prices } — always all categories
 let allTrades     = [];    // trades sorted ASC by timestamp (oldest → newest), past 1 week
-let rankings      = {};    // windowId → { byVolume[], byLargestBet[] }
+let rankings      = {};    // windowId → { byTotalEL[], byMaxEL[] }
 let currentWindow = '1H';
 let activeTag     = 'all';
 let fetching      = false;
@@ -477,6 +503,7 @@ let countdownInterval = null;
 let isFirstLoad   = true;
 let newestTradeTs = 0;    // Unix-seconds of the newest trade in allTrades (for incremental fetch)
 let fetchedMinBet = null; // minBet used for the last full fetch (detect threshold changes)
+let loadingProgress = null; // { done: N, total: N } while initial batches loading, else null
 
 // ─────────────────────────────────────────────
 //  Utilities
@@ -542,7 +569,7 @@ function showError(msg) {
 // ─────────────────────────────────────────────
 async function fetchMacroMarkets() {
   const markets = {};
-  const tagsToFetch = activeTag === 'all' ? MACRO_TAGS : MACRO_TAGS.filter(t => t.id === activeTag);
+  const tagsToFetch = MACRO_TAGS; // always fetch all categories; tag filtering happens at render time
 
   for (const tag of tagsToFetch) {
     let offset = 0;
@@ -604,8 +631,9 @@ async function fetchMacroMarkets() {
 //  Uses market= param to restrict to macro markets only,
 //  so each batch covers a tiny fraction of Polymarket's global volume.
 // ─────────────────────────────────────────────
-async function fetchTradesBatched(sinceTs, minBet, conditionIds, onProgress) {
+async function fetchTradesBatched(sinceTs, minBet, conditionIds, onProgress, onBatchDone) {
   const collected = [];
+  const totalBatches = Math.ceil(conditionIds.length / BATCH_SIZE);
 
   // Split conditionIds into batches of BATCH_SIZE
   for (let b = 0; b < conditionIds.length; b += BATCH_SIZE) {
@@ -642,16 +670,33 @@ async function fetchTradesBatched(sinceTs, minBet, conditionIds, onProgress) {
       onProgress && onProgress(`Fetching trades… ${collected.length.toLocaleString()} loaded`);
       if (!done) await sleep(SLEEP_MS);
     }
+
+    // After each market-batch: sort and notify caller so UI can render incrementally
+    if (onBatchDone) {
+      collected.sort((a, b) => (+a.timestamp || 0) - (+b.timestamp || 0));
+      onBatchDone(Math.floor(b / BATCH_SIZE) + 1, totalBatches, collected);
+    }
   }
 
-  // Sort ASC by timestamp so allTrades stays oldest-first
-  collected.sort((a, b) => (+a.timestamp || 0) - (+b.timestamp || 0));
+  // Final sort (already sorted if onBatchDone was used; sort once otherwise)
+  if (!onBatchDone) collected.sort((a, b) => (+a.timestamp || 0) - (+b.timestamp || 0));
   return collected;
 }
 
 // ─────────────────────────────────────────────
 //  Build rankings for a single time window
 // ─────────────────────────────────────────────
+
+// Returns macroMarketsAll filtered to the selected tag (or the full map for 'all').
+// Called at ranking time so tag switching is instant — no re-fetch needed.
+function getFilteredMarkets(tag) {
+  if (tag === 'all') return macroMarketsAll;
+  const out = {};
+  for (const [cid, m] of Object.entries(macroMarketsAll)) {
+    if (m.tagId === String(tag)) out[cid] = m;
+  }
+  return out;
+}
 
 // Binary search: first index in ASC-sorted trades[] where timestamp >= cutoff
 function binarySearchCutoff(trades, cutoff) {
@@ -687,36 +732,45 @@ function buildWindowRankings(trades, macroMarkets, windowSeconds, minBet, filter
       if (filterThreshold > 0 && maxP >= (1 - filterThreshold)) continue;
     }
 
-    const usdcValue = parseFloat(t.size) * parseFloat(t.price);
+    const price = parseFloat(t.price);
+    if (isNaN(price) || price <= 0 || price >= 1) continue;
+    const usdcValue    = parseFloat(t.size) * price;
     if (usdcValue < minBet) continue;
+    // expectedLoss = amount at risk × probability of losing
+    // = (size × price) × (1 − price)
+    const expectedLoss = usdcValue * (1 - price);
 
     if (!byMarket[cid]) {
       byMarket[cid] = {
-        conditionId: cid,
-        title:       meta.title,
-        slug:        meta.slug,  // always event-level slug — reliable link
-        tagName:     meta.tagName,
-        prices:      meta.prices,
-        outcomes:    meta.outcomes,
-        totalVolume: 0,
-        maxBet:      0,
-        tradeCount:  0,
-        biggestTrade: null,
+        conditionId:       cid,
+        title:             meta.title,
+        slug:              meta.slug,  // always event-level slug — reliable link
+        tagName:           meta.tagName,
+        prices:            meta.prices,
+        outcomes:          meta.outcomes,
+        totalVolume:       0,
+        totalExpectedLoss: 0,
+        maxExpectedLoss:   0,
+        maxBet:            0,   // USDC value of the highest-EL trade (for badge display)
+        tradeCount:        0,
+        biggestTrade:      null, // trade with highest expectedLoss
       };
     }
     const entry = byMarket[cid];
-    entry.totalVolume += usdcValue;
+    entry.totalVolume       += usdcValue;
+    entry.totalExpectedLoss += expectedLoss;
     entry.tradeCount++;
-    if (usdcValue > entry.maxBet) {
-      entry.maxBet = usdcValue;
-      entry.biggestTrade = t;
+    if (expectedLoss > entry.maxExpectedLoss) {
+      entry.maxExpectedLoss = expectedLoss;
+      entry.maxBet          = usdcValue;
+      entry.biggestTrade    = t;
     }
   }
 
   const list = Object.values(byMarket);
   return {
-    byVolume:     [...list].sort((a, b) => b.totalVolume - a.totalVolume).slice(0, 30),
-    byLargestBet: [...list].sort((a, b) => b.maxBet     - a.maxBet    ).slice(0, 30),
+    byTotalEL: [...list].sort((a, b) => b.totalExpectedLoss - a.totalExpectedLoss).slice(0, 30),
+    byMaxEL:   [...list].sort((a, b) => b.maxExpectedLoss   - a.maxExpectedLoss  ).slice(0, 30),
   };
 }
 
@@ -726,9 +780,10 @@ function buildWindowRankings(trades, macroMarkets, windowSeconds, minBet, filter
 function buildAllRankings(minBet) {
   const filterPct = Math.max(0, Math.min(49, parseFloat(document.getElementById('filter-extreme-pct').value) || 0));
   const filterThreshold = filterPct / 100;
+  const markets = getFilteredMarkets(activeTag); // tag filter applied here — no re-fetch needed
   const result = {};
   for (const w of WINDOWS) {
-    result[w.id] = buildWindowRankings(allTrades, macroMarkets, w.seconds, minBet, filterThreshold);
+    result[w.id] = buildWindowRankings(allTrades, markets, w.seconds, minBet, filterThreshold);
   }
   return result;
 }
@@ -757,7 +812,7 @@ function renderBetDirection(entry) {
   const arrow   = low === 'yes' ? '▲' : low === 'no' ? '▼' : '●';
   const cls     = low === 'yes' ? 'dir-yes' : low === 'no' ? 'dir-no' : 'dir-mid';
   const ago = fmtTimestamp(t.timestamp);
-  return `<span class="dir-badge ${cls}">${arrow} ${outcome} ${fmtPrice(price)} · ${fmtUSDC(entry.maxBet)}${ago ? ' · ' + ago : ''}</span>`;
+  return `<span class="dir-badge ${cls}">${arrow} ${outcome} ${fmtPrice(price)} · ${fmtUSDC(entry.maxBet)} bet · ${fmtUSDC(entry.maxExpectedLoss)} EL${ago ? ' · ' + ago : ''}</span>`;
 }
 
 function renderTable(rows, mode) {
@@ -765,29 +820,30 @@ function renderTable(rows, mode) {
     return `<table><tbody><tr><td class="no-data" colspan="9">No trades in this window</td></tr></tbody></table>`;
   }
 
-  const isVolume = mode === 'volume';
+  const isTotalEL = mode === 'volume';
   let html = `<table>
     <thead><tr>
       <th>#</th>
       <th>Market</th>
-      <th class="right landscape-col">${isVolume ? 'Volume' : 'Biggest Bet'}</th>
+      <th class="right landscape-col">${isTotalEL ? 'Total EL' : 'Max EL'}</th>
       <th class="right landscape-col">Trades</th>
     </tr></thead>
     <tbody>`;
 
   for (let i = 0; i < rows.length; i++) {
     const r = rows[i];
-    const mainValue = isVolume ? r.totalVolume : r.maxBet;
-    const subValue  = isVolume ? `${r.tradeCount} trade${r.tradeCount !== 1 ? 's' : ''}` : fmtUSDC(r.totalVolume) + ' vol';
+    const mainValue = isTotalEL ? r.totalExpectedLoss : r.maxExpectedLoss;
+    const subValue  = isTotalEL
+      ? `${fmtUSDC(r.totalVolume)} vol · ${r.tradeCount} trade${r.tradeCount !== 1 ? 's' : ''}`
+      : `${fmtUSDC(r.maxBet)} bet`;
     html += `<tr>
       <td>${renderRankBadge(i)}</td>
       <td>
         ${renderMarketName(r)}
         ${renderBetDirection(r)}
         <div class="portrait-values">
-          <span class="vol">${fmtUSDC(mainValue)}</span>
+          <span class="vol">${fmtUSDC(mainValue)} EL</span>
           <span class="vol-sub">${subValue}</span>
-          <span class="vol-sub">· ${r.tradeCount.toLocaleString()} trades</span>
         </div>
         <small class="outcome-badge">${r.tagName || ''}</small>
       </td>
@@ -803,53 +859,60 @@ function renderTable(rows, mode) {
 function renderSummary(windowId) {
   const r = rankings[windowId];
   if (!r) return '';
-  const totalVol = r.byVolume.reduce((s, x) => s + x.totalVolume, 0);
-  const totalTrades = r.byVolume.reduce((s, x) => s + x.tradeCount, 0);
-  const maxSingle = r.byLargestBet[0] ? r.byLargestBet[0].maxBet : 0;
+  const totalEL     = r.byTotalEL.reduce((s, x) => s + x.totalExpectedLoss, 0);
+  const totalTrades = r.byTotalEL.reduce((s, x) => s + x.tradeCount, 0);
+  const maxSingleEL = r.byMaxEL[0] ? r.byMaxEL[0].maxExpectedLoss : 0;
   return `
     <div class="summary-bar">
       <div class="summary-item">
-        <div class="summary-value">${fmtUSDC(totalVol)}</div>
-        <div class="summary-label">Total macro volume</div>
+        <div class="summary-value">${fmtUSDC(totalEL)}</div>
+        <div class="summary-label">Total expected loss</div>
       </div>
       <div class="summary-item">
         <div class="summary-value">${totalTrades.toLocaleString()}</div>
         <div class="summary-label">Qualifying trades</div>
       </div>
       <div class="summary-item">
-        <div class="summary-value">${fmtUSDC(maxSingle)}</div>
-        <div class="summary-label">Largest single bet</div>
+        <div class="summary-value">${fmtUSDC(maxSingleEL)}</div>
+        <div class="summary-label">Max single trade EL</div>
       </div>
       <div class="summary-item">
-        <div class="summary-value">${r.byVolume.length}</div>
+        <div class="summary-value">${r.byTotalEL.length}</div>
         <div class="summary-label">Active markets</div>
       </div>
     </div>`;
 }
 
 function renderAllPanels() {
+  const progressHtml = loadingProgress
+    ? `<div class="panel-loading-bar">
+        <span class="panel-loading-text">Loading market data… ${loadingProgress.done} of ${loadingProgress.total} groups</span>
+        <div class="progress-track"><div class="progress-fill" style="width:${Math.round(loadingProgress.done / loadingProgress.total * 100)}%"></div></div>
+      </div>`
+    : '';
   for (const w of WINDOWS) {
-    const r = rankings[w.id] || { byVolume: [], byLargestBet: [] };
+    const r = rankings[w.id] || { byTotalEL: [], byMaxEL: [] };
     document.getElementById(`panel-${w.id}`).innerHTML = `
       <div class="panel-header">
         <span class="panel-title">${w.label}</span>
-        <span class="panel-subtitle">by USDC value (size × price)</span>
+        <span class="panel-subtitle">ranked by expected loss · EL = bet × p(lose)</span>
       </div>
+      ${progressHtml}
       ${renderSummary(w.id)}
       <div class="tables-row">
         <div class="table-card">
           <div class="table-card-header">
             <span class="table-card-icon">🐋</span>
-            <span class="table-card-title">Ranked by Largest Single Bet</span>
+            <span class="table-card-title">Ranked by Highest Single Expected Loss</span>
           </div>
-          ${renderTable(r.byLargestBet, 'largest')}
+          ${renderTable(r.byMaxEL, 'largest')}
         </div>
         <div class="table-card">
           <div class="table-card-header">
             <span class="table-card-icon">📊</span>
-            <span class="table-card-title">Ranked by Total Volume</span>
+            <span class="table-card-title">Ranked by Total Expected Loss</span>
           </div>
-          ${renderTable(r.byVolume, 'volume')}
+          ${renderTable(r.byTotalEL, 'volume')}
         </div>
       </div>`;
   }
@@ -872,13 +935,11 @@ async function refresh(force = false) {
   setStatus('loading', 'Refreshing…');
   showError('');
 
-  const minBet     = parseFloat(document.getElementById('min-bet').value) || 0;
-  const oneWeekAgo = Math.floor(Date.now() / 1000) - 604_800;
-  const firstLoad  = isFirstLoad;
-
-  // First load OR forced full re-fetch (minBet changed): fetch full 1W.
-  // Background refresh: fetch only trades since the newest trade we already have.
-  const sinceTs = (firstLoad || newestTradeTs === 0) ? oneWeekAgo : newestTradeTs;
+  const minBet      = parseFloat(document.getElementById('min-bet').value) || 0;
+  const oneWeekAgo  = Math.floor(Date.now() / 1000) - 604_800;
+  const firstLoad   = isFirstLoad;
+  const isFullFetch = firstLoad || newestTradeTs === 0;
+  const sinceTs     = isFullFetch ? oneWeekAgo : newestTradeTs;
 
   const onProgress = firstLoad
     ? msg => setLoading(true, msg)
@@ -886,23 +947,37 @@ async function refresh(force = false) {
 
   try {
     onProgress('Fetching macro markets…');
-    macroMarkets = await fetchMacroMarkets();
+    macroMarketsAll = await fetchMacroMarkets();
 
-    const conditionIds = Object.keys(macroMarkets);
+    const conditionIds = Object.keys(macroMarketsAll);
     if (conditionIds.length === 0) throw new Error('No macro markets found. Polymarket API may be temporarily unavailable.');
 
-    const label = firstLoad ? '1 week' : 'last refresh';
+    const label = isFullFetch ? '1 week' : 'last refresh';
     onProgress(`Found ${conditionIds.length} markets. Fetching trades since ${label}…`);
-    const newTrades = await fetchTradesBatched(sinceTs, minBet, conditionIds, onProgress);
 
-    if (firstLoad || newestTradeTs === 0) {
-      allTrades = newTrades;  // full replace on first/forced load
+    // Progressive batch callback: dismiss splash after first batch, show in-panel progress bar.
+    // Only used for full fetches (first load or forced re-fetch after filter change).
+    let splashDismissed = false;
+    const onBatchDone = isFullFetch ? (done, total, sortedTrades) => {
+      allTrades = sortedTrades; // sortedTrades is the live collected[] reference — already sorted ASC
+      loadingProgress = { done, total };
+      if (firstLoad && !splashDismissed) {
+        setLoading(false);  // dismiss splash — show app immediately
+        splashDismissed = true;
+      }
+      rankings = buildAllRankings(minBet);
+      renderAllPanels();
+    } : null;
+
+    const newTrades = await fetchTradesBatched(sinceTs, minBet, conditionIds, onProgress, onBatchDone);
+
+    if (isFullFetch) {
+      allTrades = newTrades; // newTrades === sortedTrades from last callback (same reference)
     } else {
-      // Merge: deduplicate by transactionHash, then prune trades older than 1W
+      // Incremental: merge new trades, deduplicate, prune old
       const seen = new Set(allTrades.map(t => t.transactionHash));
       const fresh = newTrades.filter(t => !seen.has(t.transactionHash));
       allTrades = [...allTrades, ...fresh];
-      // Prune from front (allTrades is sorted ASC, old trades are at index 0)
       let pruneIdx = 0;
       while (pruneIdx < allTrades.length && (+allTrades[pruneIdx].timestamp || 0) < oneWeekAgo) pruneIdx++;
       if (pruneIdx > 0) allTrades = allTrades.slice(pruneIdx);
@@ -914,6 +989,7 @@ async function refresh(force = false) {
     }
     fetchedMinBet = minBet;
 
+    loadingProgress = null; // all batches done — hide progress bar
     rankings = buildAllRankings(minBet);
     renderAllPanels();
 
@@ -924,7 +1000,8 @@ async function refresh(force = false) {
     showError(err.message || 'Failed to fetch data. Check your network connection.');
     console.error(err);
   } finally {
-    if (firstLoad) setLoading(false);
+    if (firstLoad) setLoading(false); // safety: dismiss splash even if error before first batch
+    loadingProgress = null;           // safety: clear bar on error
     isFirstLoad = false;
     fetching    = false;
     document.getElementById('refresh-btn').disabled = false;
@@ -973,7 +1050,7 @@ function setTag(el, tagId) {
   document.querySelectorAll('.tag-btn').forEach(b => b.classList.remove('active'));
   el.classList.add('active');
   activeTag = tagId;
-  triggerRefresh();
+  applyFilters(); // instant re-rank — no re-fetch; all category trades already in allTrades
 }
 
 function applyFilters() {
