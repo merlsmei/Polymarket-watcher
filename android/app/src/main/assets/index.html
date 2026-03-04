@@ -504,6 +504,7 @@ let isFirstLoad   = true;
 let newestTradeTs = 0;    // Unix-seconds of the newest trade in allTrades (for incremental fetch)
 let fetchedMinBet = null; // minBet used for the last full fetch (detect threshold changes)
 let loadingProgress = null; // { done: N, total: N } while initial batches loading, else null
+let oldestTradeTs   = 0;   // Unix-seconds of oldest trade ever loaded (persists after loading)
 
 // ─────────────────────────────────────────────
 //  Utilities
@@ -811,8 +812,9 @@ function renderBetDirection(entry) {
   const low     = outcome.toLowerCase();
   const arrow   = low === 'yes' ? '▲' : low === 'no' ? '▼' : '●';
   const cls     = low === 'yes' ? 'dir-yes' : low === 'no' ? 'dir-no' : 'dir-mid';
-  const ago = fmtTimestamp(t.timestamp);
-  return `<span class="dir-badge ${cls}">${arrow} ${outcome} ${fmtPrice(price)} · ${fmtUSDC(entry.maxBet)} bet · ${fmtUSDC(entry.maxExpectedLoss)} EL${ago ? ' · ' + ago : ''}</span>`;
+  const winSize = entry.maxBet / price;
+  const hoursAgo = t.timestamp ? Math.round((Date.now() / 1000 - t.timestamp) / 3600) : null;
+  return `<span class="dir-badge ${cls}">${arrow} ${outcome} ${fmtPrice(price)} · Win ${fmtUSDC(winSize)} / Bet ${fmtUSDC(entry.maxBet)}${hoursAgo !== null ? ' · ' + hoursAgo + 'h' : ''}</span>`;
 }
 
 function renderTable(rows, mode) {
@@ -833,21 +835,32 @@ function renderTable(rows, mode) {
   for (let i = 0; i < rows.length; i++) {
     const r = rows[i];
     const mainValue = isTotalEL ? r.totalExpectedLoss : r.maxExpectedLoss;
-    const subValue  = isTotalEL
-      ? `${fmtUSDC(r.totalVolume)} vol · ${r.tradeCount} trade${r.tradeCount !== 1 ? 's' : ''}`
-      : `${fmtUSDC(r.maxBet)} bet`;
+    let colMain, colSub, portraitMain, portraitSub;
+    if (isTotalEL) {
+      colMain     = fmtUSDC(mainValue);
+      colSub      = `${fmtUSDC(r.totalVolume)} vol · ${r.tradeCount} trade${r.tradeCount !== 1 ? 's' : ''}`;
+      portraitMain = colMain + ' EL';
+      portraitSub  = colSub;
+    } else {
+      const price = r.biggestTrade ? parseFloat(r.biggestTrade.price) : 0;
+      const er    = price > 0 ? r.maxBet * (1 - price) / price : 0;
+      colMain     = `${fmtUSDC(mainValue)} EL`;
+      colSub      = `${fmtUSDC(er)} ER`;
+      portraitMain = colMain;
+      portraitSub  = colSub;
+    }
     html += `<tr>
       <td>${renderRankBadge(i)}</td>
       <td>
         ${renderMarketName(r)}
         ${renderBetDirection(r)}
         <div class="portrait-values">
-          <span class="vol">${fmtUSDC(mainValue)} EL</span>
-          <span class="vol-sub">${subValue}</span>
+          <span class="vol">${portraitMain}</span>
+          <span class="vol-sub">${portraitSub}</span>
         </div>
         <small class="outcome-badge">${r.tagName || ''}</small>
       </td>
-      <td class="right landscape-col"><span class="vol">${fmtUSDC(mainValue)}</span><br><span class="vol-sub">${subValue}</span></td>
+      <td class="right landscape-col"><span class="vol">${colMain}</span><br><span class="vol-sub">${colSub}</span></td>
       <td class="right landscape-col">${r.tradeCount.toLocaleString()}</td>
     </tr>`;
   }
@@ -884,10 +897,11 @@ function renderSummary(windowId) {
 }
 
 function renderAllPanels() {
-  const progressHtml = loadingProgress
+  const ageH = oldestTradeTs ? Math.round((Date.now() / 1000 - oldestTradeTs) / 3600) : null;
+  const progressHtml = ageH !== null
     ? `<div class="panel-loading-bar">
-        <span class="panel-loading-text">Loading market data… ${loadingProgress.done} of ${loadingProgress.total} groups</span>
-        <div class="progress-track"><div class="progress-fill" style="width:${Math.round(loadingProgress.done / loadingProgress.total * 100)}%"></div></div>
+        <span class="panel-loading-text">Loaded back to ${ageH}h${loadingProgress ? ` · ${loadingProgress.done} / ${loadingProgress.total}` : ''}</span>
+        ${loadingProgress ? `<div class="progress-track"><div class="progress-fill" style="width:${Math.round(loadingProgress.done / loadingProgress.total * 100)}%"></div></div>` : ''}
       </div>`
     : '';
   for (const w of WINDOWS) {
@@ -966,6 +980,7 @@ async function refresh(force = false) {
     // Only used for full fetches (first load or forced re-fetch after filter change).
     const onBatchDone = isFullFetch ? (done, total, sortedTrades) => {
       allTrades = sortedTrades; // sortedTrades is the live collected[] reference — already sorted ASC
+      if (allTrades.length > 0) oldestTradeTs = +allTrades[0].timestamp || 0;
       loadingProgress = { done, total };
       if (firstLoad && !splashDismissed) {
         setLoading(false);  // dismiss splash — show app immediately
